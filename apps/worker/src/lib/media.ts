@@ -22,6 +22,24 @@ interface FFProbeOutput {
   }>;
 }
 
+/**
+ * 永久探测失败：重试无法改变结果（文件本身没有音轨、时长非法）。
+ * 这类错误不应触发重试，应立即把任务终结为 FAILED。
+ */
+export class PermanentProbeError extends Error {
+  readonly failureCode: "NO_AUDIO_STREAM" | "INVALID_DURATION";
+
+  constructor(failureCode: "NO_AUDIO_STREAM" | "INVALID_DURATION") {
+    super(failureCode);
+    this.name = "PermanentProbeError";
+    this.failureCode = failureCode;
+  }
+}
+
+export function isPermanentProbeError(error: unknown): error is PermanentProbeError {
+  return error instanceof PermanentProbeError;
+}
+
 export async function probeAudio(filePath: string): Promise<ProbeResult> {
   const { stdout } = await execFileAsync(
     "ffprobe",
@@ -38,9 +56,9 @@ export async function probeAudio(filePath: string): Promise<ProbeResult> {
   );
   const parsed = JSON.parse(stdout) as FFProbeOutput;
   const stream = parsed.streams?.find((item) => item.codec_type === "audio");
-  if (!stream) throw new Error("NO_AUDIO_STREAM");
+  if (!stream) throw new PermanentProbeError("NO_AUDIO_STREAM");
   const durationSeconds = Number(parsed.format?.duration ?? stream.duration ?? 0);
-  if (!Number.isFinite(durationSeconds) || durationSeconds <= 0) throw new Error("INVALID_DURATION");
+  if (!Number.isFinite(durationSeconds) || durationSeconds <= 0) throw new PermanentProbeError("INVALID_DURATION");
   return {
     durationMs: BigInt(Math.round(durationSeconds * 1000)),
     codec: stream.codec_name ?? "unknown",

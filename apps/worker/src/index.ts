@@ -3,12 +3,13 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { pipeline } from "node:stream/promises";
-import { Worker } from "bullmq";
+import { UnrecoverableError, Worker, type Job } from "bullmq";
 import { Redis } from "ioredis";
 import { getConfig } from "./config/env.js";
 import { prisma } from "./lib/prisma.js";
 import { deleteObject, getObjectStream, putObject } from "./lib/s3.js";
 import { generatePeaks, probeAudio } from "./lib/media.js";
+import { classifyProbeError, errorMessage } from "./lib/probe-retry.js";
 import { buildUserExport } from "./lib/export.js";
 
 const config = getConfig();
@@ -20,9 +21,15 @@ const log = (level: "info" | "error" | "warn", data: Record<string, unknown>, me
   else console.log(output);
 };
 
-async function processMedia(mediaId: string) {
+async function processMedia(job: Job) {
+  const mediaId = String(job.data.mediaId);
   const media = await prisma.mediaAsset.findUnique({ where: { id: mediaId } });
   if (!media) return;
+  // 幂等：重复任务或迟到的重试不得触碰已经完成（READY）的结果
+  if (media.status === "READY") {
+    log("info", { mediaId }, "media already ready, skipping duplicate probe");
+    return;
+  }
   await prisma.mediaAsset.update({
     where: { id: mediaId },
     data: { status: "PROCESSING", failureCode: null, failureMessage: null },
@@ -35,9 +42,11 @@ async function processMedia(mediaId: string) {
     const stream = await getObjectStream(media.objectKey);
     await pipeline(stream, createWriteStream(localPath));
     const [probe, peaks] = await Promise.all([probeAudio(localPath), generatePeaks(localPath)]);
-    await prisma.$transaction(async (tx) => {
-      await tx.mediaAsset.update({
-        where: { id: mediaId },
+    // 只允许落一份结果：条件更新保证迟到的重试/并发任务不会覆盖已有 READY，
+    // 会话状态推进也只在真正写入结果的这一次发生
+    const completed = await prisma.$transaction(async (tx) => {
+      const result = await tx.mediaAsset.updateMany({
+        where: { id: mediaId, status: { not: "READY" } },
         data: {
           status: "READY",
           durationMs: probe.durationMs,
@@ -51,25 +60,53 @@ async function processMedia(mediaId: string) {
           failureMessage: null,
         },
       });
+      if (result.count === 0) return false;
       await tx.practiceSession.updateMany({
         where: { id: media.sessionId, userId: media.userId, status: "DRAFT" },
         data: { status: "IN_REVIEW", version: { increment: 1 } },
       });
+      return true;
     });
-    log("info", { mediaId, durationMs: Number(probe.durationMs) }, "media probe completed");
+    if (completed) log("info", { mediaId, durationMs: Number(probe.durationMs) }, "media probe completed");
+    else log("info", { mediaId }, "media result already present, skipping duplicate completion");
   } catch (error) {
-    const message = error instanceof Error ? error.message : "UNKNOWN_MEDIA_ERROR";
-    const code = message === "NO_AUDIO_STREAM" ? "NO_AUDIO_STREAM" : message === "INVALID_DURATION" ? "INVALID_DURATION" : "MEDIA_PROBE_FAILED";
-    await prisma.mediaAsset.update({
-      where: { id: mediaId },
+    const failure = classifyProbeError(error);
+    const maxAttempts = job.opts.attempts ?? 1;
+    const isLastAttempt = job.attemptsMade + 1 >= maxAttempts;
+
+    if (!failure.permanent && !isLastAttempt) {
+      // 瞬时故障且仍有剩余尝试：不落 FAILED，抛出后由队列按退避策略自动重试
+      log("warn", {
+        mediaId,
+        err: errorMessage(error),
+        attempt: job.attemptsMade + 1,
+        maxAttempts,
+      }, "media probe transient failure, will retry");
+      throw error;
+    }
+
+    // 永久失败，或瞬时失败已重试耗尽：唯一一次落 FAILED 并终结任务
+    await prisma.mediaAsset.updateMany({
+      where: { id: mediaId, status: { not: "READY" } },
       data: {
         status: "FAILED",
-        failureCode: code,
-        failureMessage: message === "NO_AUDIO_STREAM" ? "文件中没有可用的音轨" : "音频无法解析，请替换文件后重试",
+        failureCode: failure.code,
+        failureMessage: failure.message,
         processedAt: new Date(),
       },
     });
-    log("error", { mediaId, err: message }, "media probe failed");
+    log("error", {
+      mediaId,
+      code: failure.code,
+      err: errorMessage(error),
+      attempt: job.attemptsMade + 1,
+      maxAttempts,
+    }, failure.permanent ? "media probe permanently failed" : "media probe failed after retries");
+    if (failure.permanent) {
+      // 永久失败：阻止 BullMQ 继续重试，立即终结
+      throw new UnrecoverableError(`${failure.code}: ${errorMessage(error)}`);
+    }
+    throw error;
   } finally {
     await rm(workDir, { recursive: true, force: true });
   }
@@ -128,7 +165,7 @@ async function scanOverdueGoals() {
 const worker = new Worker(
   "media-processing",
   async (job) => {
-    if (job.name === "probe-media") return processMedia(String(job.data.mediaId));
+    if (job.name === "probe-media") return processMedia(job);
     if (job.name === "cleanup-session") return cleanupSession(String(job.data.sessionId));
     if (job.name === "export-data") return exportData(String(job.data.exportId));
     throw new Error(`Unknown job: ${job.name}`);
