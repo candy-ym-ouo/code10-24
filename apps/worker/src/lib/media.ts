@@ -4,6 +4,41 @@ import { promisify } from "node:util";
 
 const execFileAsync = promisify(execFile);
 
+/**
+ * 文件内容本身不可恢复的错误：重试不会改变结果，只能标记为永久失败。
+ * S3/网络/ffprobe 超时、进程启动失败等瞬时错误不属于此类。
+ */
+export type MediaFailureCode = "NO_AUDIO_STREAM" | "INVALID_DURATION" | "EMPTY_PCM";
+
+export class MediaContentError extends Error {
+  readonly code: MediaFailureCode;
+
+  constructor(code: MediaFailureCode) {
+    super(code);
+    this.name = "MediaContentError";
+    this.code = code;
+  }
+}
+
+const PERMANENT_FAILURE_MESSAGES: Record<MediaFailureCode, string> = {
+  NO_AUDIO_STREAM: "文件中没有可用的音轨",
+  INVALID_DURATION: "无法读取有效的音频时长，文件可能已损坏",
+  EMPTY_PCM: "音频无法解码，文件可能已损坏",
+};
+
+export interface MediaFailure {
+  permanent: boolean;
+  code: MediaFailureCode | null;
+  message: string | null;
+}
+
+export function describeMediaFailure(error: unknown): MediaFailure {
+  if (error instanceof MediaContentError) {
+    return { permanent: true, code: error.code, message: PERMANENT_FAILURE_MESSAGES[error.code] };
+  }
+  return { permanent: false, code: null, message: null };
+}
+
 export interface ProbeResult {
   durationMs: bigint;
   codec: string;
@@ -38,9 +73,9 @@ export async function probeAudio(filePath: string): Promise<ProbeResult> {
   );
   const parsed = JSON.parse(stdout) as FFProbeOutput;
   const stream = parsed.streams?.find((item) => item.codec_type === "audio");
-  if (!stream) throw new Error("NO_AUDIO_STREAM");
+  if (!stream) throw new MediaContentError("NO_AUDIO_STREAM");
   const durationSeconds = Number(parsed.format?.duration ?? stream.duration ?? 0);
-  if (!Number.isFinite(durationSeconds) || durationSeconds <= 0) throw new Error("INVALID_DURATION");
+  if (!Number.isFinite(durationSeconds) || durationSeconds <= 0) throw new MediaContentError("INVALID_DURATION");
   return {
     durationMs: BigInt(Math.round(durationSeconds * 1000)),
     codec: stream.codec_name ?? "unknown",
@@ -71,7 +106,7 @@ export async function generatePeaks(filePath: string, bucketCount = 1600): Promi
 
   const samples = Buffer.concat(chunks);
   const sampleCount = Math.floor(samples.length / 2);
-  if (sampleCount === 0) throw new Error("EMPTY_PCM");
+  if (sampleCount === 0) throw new MediaContentError("EMPTY_PCM");
   const actualBuckets = Math.min(bucketCount, sampleCount);
   const bucketSize = Math.max(1, Math.ceil(sampleCount / actualBuckets));
   const result: number[] = [];
